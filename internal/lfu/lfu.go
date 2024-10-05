@@ -5,6 +5,15 @@ import (
 	"iter"
 )
 
+// Main algorithm idea: usage of:
+// 1) linked list for storing all cache elements.
+// List structure: blocks of elements of each frequency.
+// The blocks are ordered in descending frequency.
+// Elements in the block are ordered by recency of use.
+// 2) Frequency to first element of block map.
+// 3) Key to element map.
+// Pic notation: ()_i - block of i frequency, + - element in block. Example: (+, +)_3 - (+)_1.
+
 var ErrKeyNotFound = errors.New("key not found")
 
 const DefaultCapacity = 5
@@ -50,35 +59,191 @@ type Cache[K comparable, V any] interface {
 	GetKeyFrequency(key K) (int, error)
 }
 
-// cacheImpl represents LFU cache implementation
-type cacheImpl[K comparable, V any] struct{}
+// CacheImpl represents LFU cache implementation
+type CacheImpl[K comparable, V any] struct {
+	listOfData               *list[*node[K, V]]
+	keyToElement             map[K]*element[*node[K, V]]
+	frequencyToRecentElement map[int]*element[*node[K, V]]
+	capacity                 int
+	defaultValue             V
+}
 
 // New initializes the cache with the given capacity.
 // If no capacity is provided, the cache will use DefaultCapacity.
-func New[K comparable, V any](capacity ...int) *cacheImpl[K, V] {
-	return new(cacheImpl[K, V])
+func New[K comparable, V any](capacity ...int) *CacheImpl[K, V] {
+	var cacheCapacity int
+	if len(capacity) > 0 {
+		if capacity[0] < 0 {
+			panic("Negative capacity does not supported.")
+		}
+		cacheCapacity = capacity[0]
+	} else {
+		cacheCapacity = DefaultCapacity
+	}
+	return &CacheImpl[K, V]{
+		listOfData:               newList[*node[K, V]](),
+		keyToElement:             make(map[K]*element[*node[K, V]], cacheCapacity),
+		frequencyToRecentElement: make(map[int]*element[*node[K, V]], cacheCapacity),
+		capacity:                 cacheCapacity,
+	}
 }
 
-func (l *cacheImpl[K, V]) Get(key K) (V, error) {
-	panic("not implemented")
+// Get removes element from list, increase its frequency and puts it back in list.
+func (l *CacheImpl[K, V]) Get(key K) (V, error) {
+	if link, ok := l.keyToElement[key]; ok {
+		n := l.getNodeFromElement(link)
+		l.removeFromList(link)
+		l.removeFreqLevel(link)
+		n.freq++
+		l.addToList(newElement(n), link)
+		return n.value, nil
+	}
+	return l.defaultValue, ErrKeyNotFound
 }
 
-func (l *cacheImpl[K, V]) Put(key K, value V) {
-	panic("not implemented")
+// node: struct for storing cache elements.
+type node[K comparable, V any] struct {
+	key   K
+	value V
+	freq  int
 }
 
-func (l *cacheImpl[K, V]) All() iter.Seq2[K, V] {
-	panic("not implemented")
+// getNodeFromElement gets node from List element.
+func (l *CacheImpl[K, V]) getNodeFromElement(element *element[*node[K, V]]) *node[K, V] {
+	return element.value
 }
 
-func (l *cacheImpl[K, V]) Size() int {
-	panic("not implemented")
+// addToList: method to add new element to cache list.
+func (l *CacheImpl[K, V]) addToList(link *element[*node[K, V]], previousLinkOfElement *element[*node[K, V]]) {
+	// Empty cache case.
+	if l.listOfData.Len() == 0 {
+		l.listOfData.Add(link)
+	}
+
+	n := l.getNodeFromElement(link)
+	lastFreqRoot, freqExists := l.frequencyToRecentElement[n.freq]
+	if freqExists {
+		// Case when we just need to add element before the most recent used element of such frequency.
+		// pic: (...)_n+1 - (+, +)_n - (x, ...)_n-1 --> (...)_n+1 - (x, +, +) - (...)_n-1
+		l.listOfData.AddBefore(link, lastFreqRoot)
+	} else if n.freq < l.listOfData.Back().value.freq {
+		// Case when we add element of minimal frequency. We need to add it in the end of list.
+		// pic: (...)_n+1 - (...)_n  --> (...)_n+1 - (...)_n - (x)_m, m < n
+		l.listOfData.Add(link)
+	} else if n.freq != 1 {
+		// Case when last frequency level might exist.
+		lastPastFreqRoot, pastFreqExists := l.frequencyToRecentElement[n.freq-1]
+		if pastFreqExists {
+			// Case when frequency - 1 level exists. It means that we need to add our element before
+			// the most recent used element of frequency - 1 level.
+			// pic: (...)_n+2 - (x, +)_n --> (...)_n+2 - (x)_n+1 - (+)_n
+			l.listOfData.AddBefore(link, lastPastFreqRoot)
+		} else {
+			// Case when frequency - 1 level does not exist. It means, that element to add in list was the only one
+			// on frequency - 1 level before frequency increase. We can replace old element with new element.
+			// pic: (+)_n+1 - (x)_n-1 - (+)_n-2 --> (+)_n+1 - (x)_n - (+)_n-2
+			l.listOfData.ReplaceDeletedElement(link, previousLinkOfElement)
+		}
+	}
+	l.frequencyToRecentElement[n.freq] = link
+	l.keyToElement[n.key] = link
 }
 
-func (l *cacheImpl[K, V]) Capacity() int {
-	panic("not implemented")
+// removeFromList removes element from List and removes frequency level if element was only one on it.
+func (l *CacheImpl[K, V]) removeFromList(link *element[*node[K, V]]) {
+	l.listOfData.Remove(link)
+	l.removeFreqLevel(link)
 }
 
-func (l *cacheImpl[K, V]) GetKeyFrequency(key K) (int, error) {
-	panic("not implemented")
+// removeFreqLevel removes frequency level if argument was single on it or makes other element
+// of this frequency level representative.
+func (l *CacheImpl[K, V]) removeFreqLevel(link *element[*node[K, V]]) {
+	if link == nil || link.next == nil {
+		return
+	}
+	n := l.getNodeFromElement(link)
+	previousEl := l.getNodeFromElement(link.next)
+	if l.frequencyToRecentElement[n.freq] == link {
+		if previousEl != nil && previousEl.freq == n.freq {
+			l.frequencyToRecentElement[n.freq] = link.next
+		} else {
+			delete(l.frequencyToRecentElement, n.freq)
+		}
+	}
+}
+
+// extractLatest extracts the least recently used element of all least frequently used elements.
+// If this element was frequency level least frequently used, removes this level.
+func (l *CacheImpl[K, V]) extractLatest() {
+	del := l.listOfData.PopBack()
+	n := l.getNodeFromElement(del)
+	if l.frequencyToRecentElement[n.freq] == del {
+		delete(l.frequencyToRecentElement, n.freq)
+	}
+	delete(l.keyToElement, n.key)
+}
+
+// Put puts new node to cache.
+func (l *CacheImpl[K, V]) Put(key K, value V) {
+	if link, ok := l.keyToElement[key]; ok {
+		// Case when cache contains element with such key. Put removes this element from list
+		// and adds it with new frequency.
+		n := l.getNodeFromElement(link)
+		l.removeFromList(link)
+		l.removeFreqLevel(link)
+		n.value = value
+		n.freq++
+		l.addToList(newElement(n), link)
+		return
+	}
+
+	if l.Size() == l.capacity {
+		// Case when adding occurs to a full cache. Extract latest element and then add new.
+		l.extractLatest()
+	}
+
+	// New cache element (node) creation.
+	n := &node[K, V]{
+		key:   key,
+		value: value,
+		freq:  1,
+	}
+
+	l.keyToElement[key] = newElement(n)
+	// Addition to the list of elements.
+	l.addToList(l.keyToElement[key], nil)
+}
+
+// All returns iterator function witch iterates all cache elements in the order they are stored,
+// yielding each key-value pair to the provided yield function.
+func (l *CacheImpl[K, V]) All() iter.Seq2[K, V] {
+	return func(yield func(K, V) bool) {
+		cur := l.listOfData.Front()
+		for range l.Size() {
+			n := l.getNodeFromElement(cur)
+			if !yield(n.key, n.value) {
+				return
+			}
+			cur = cur.Next()
+		}
+	}
+}
+
+// Size returns the cache size (value of elements in List).
+func (l *CacheImpl[K, V]) Size() int {
+	return l.listOfData.Len()
+}
+
+// Capacity returns the cache capacity.
+func (l *CacheImpl[K, V]) Capacity() int {
+	return l.capacity
+}
+
+// GetKeyFrequency returns the frequency of given key element if such key exists.
+func (l *CacheImpl[K, V]) GetKeyFrequency(key K) (int, error) {
+	if link, ok := l.keyToElement[key]; ok {
+		n := l.getNodeFromElement(link)
+		return n.freq, nil
+	}
+	return 0, ErrKeyNotFound
 }
